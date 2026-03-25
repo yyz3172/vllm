@@ -143,7 +143,9 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        return cls(
+        from vllm.v1.engine.core import unpack_sharing_cache_salt
+        sharing_cache_salt = unpack_sharing_cache_salt(request.request_id)
+        req = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -159,6 +161,9 @@ class Request:
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
         )
+        if sharing_cache_salt is not None:
+            req.sharing_cache_salt = sharing_cache_salt
+        return req
 
     def append_output_token_ids(
         self,

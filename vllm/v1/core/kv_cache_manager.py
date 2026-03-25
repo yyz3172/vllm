@@ -10,12 +10,17 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def request_get_sharing_cache_salt(request) -> str | None:
+    return (None if not hasattr(request, "sharing_cache_salt")
+            else request.sharing_cache_salt)
 
 
 @dataclass
@@ -296,15 +301,19 @@ class KVCacheManager:
                 "Computed blocks should be empty when prefix caching is disabled"
             )
 
+        sharing_cache_salt = request_get_sharing_cache_salt(request)
+
         if new_computed_block_list is not self.empty_kv_cache_blocks.blocks:
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.save_new_computed_blocks(
-                request.request_id, new_computed_block_list
+            self.coordinator.save_new_computed_blocks_with_session(
+                request.request_id, new_computed_block_list,
+                sharing_cache_salt,
             )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot, num_encoder_tokens
+        new_blocks = self.coordinator.allocate_new_blocks_with_session(
+            request.request_id, num_tokens_need_slot, num_encoder_tokens,
+            sharing_cache_salt,
         )
 
         # P/D: delay caching blocks if we have to recv from
@@ -322,6 +331,10 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def release_kv_cache(self, session_id: str,
+                         block_hashes: list[BlockHash]) -> int:
+        return self.coordinator.aging_block(session_id, block_hashes)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

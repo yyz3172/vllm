@@ -18,12 +18,12 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     ExternalBlockHash,
-    FreeKVCacheBlockQueue,
     KVCacheBlock,
     get_block_hash,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.two_phase_block_queue import TwoPhaseBlockQueue
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -163,7 +163,7 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = TwoPhaseBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -450,6 +450,12 @@ class BlockPool:
             self.kv_event_queue.append(AllBlocksCleared())
 
         return True
+
+    def aging_block(self, blocks: list[KVCacheBlock]) -> int:
+        num = 0
+        for i in range(len(blocks) - 1, -1, -1):
+            num += self.free_block_queue.aging_block(blocks[i])
+        return num
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.

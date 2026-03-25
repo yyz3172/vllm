@@ -1527,6 +1527,12 @@ class Scheduler(SchedulerInterface):
         )
         return spec_decoding_stats
 
+    def release_kv_cache(self, session_id: str,
+                         block_hashes: list) -> int:
+        return self.kv_cache_manager.release_kv_cache(
+            session_id, block_hashes
+        )
+
     def shutdown(self) -> None:
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()

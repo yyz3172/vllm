@@ -352,6 +352,15 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
 
+    async def release_kv_cache(
+        self,
+        session_id: str,
+        token_requests: list[tuple[EngineCoreRequest, int]],
+    ) -> int:
+        return await self.engine_core.release_kv_cache(
+            session_id, token_requests
+        )
+
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
     # requests we don't need to send multiple messages to core proc,

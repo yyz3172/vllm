@@ -129,6 +129,13 @@ class EngineCoreClient(ABC):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
+    async def release_kv_cache(
+        self,
+        session_id: str,
+        token_requests: list[tuple[Sequence[bytestr], int]],
+    ) -> int:
+        raise NotImplementedError
+
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
@@ -931,6 +938,15 @@ class AsyncMPClient(MPClient):
 
         future.add_done_callback(add_pending)
         return future
+
+    async def release_kv_cache(
+        self,
+        session_id: str,
+        token_requests: list[tuple[Sequence[bytestr], int]],
+    ) -> int:
+        return await self.call_utility_async(
+            "release_kv_cache", session_id, token_requests
+        )
 
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)

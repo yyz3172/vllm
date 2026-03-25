@@ -185,5 +185,9 @@ class SchedulerInterface(ABC):
         """Shutdown the scheduler."""
         raise NotImplementedError
 
+    def release_kv_cache(self, session_id: str,
+                         block_hashes: list) -> int:
+        raise NotImplementedError
+
     def get_kv_connector(self) -> Optional["KVConnectorBase_V1"]:
         return None

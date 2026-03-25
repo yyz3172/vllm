@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Iterable, Mapping
-from typing import Any
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm.v1.serial_utils import bytestr
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs.data import PromptType
@@ -184,6 +187,11 @@ class EngineClient(ABC):
     ):
         """Perform a collective RPC call to the given path."""
         raise NotImplementedError
+
+    async def release_kv_cache(self, session_id: str,
+                              token_requests: list[tuple["Sequence[bytestr]",
+                                                         int]]) -> int:
+        return 0
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""

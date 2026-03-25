@@ -5,8 +5,12 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+
+logger = init_logger(__name__)
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_session_manager import KvCacheSessionManager
 from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
@@ -62,6 +66,42 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
+        self.kv_cache_session_manager = KvCacheSessionManager()
+
+    def aging_block(self, session_id, block_hashes) -> int:
+        aging_blocks = []
+        for block_hash in block_hashes:
+            if cached_block := self.block_pool.get_cached_block(
+                block_hash, [self.kv_cache_group_id]
+            ):
+                aging_blocks.append(cached_block[0])
+            else:
+                break
+        aging_blocks = self.kv_cache_session_manager.release_blocks(
+            aging_blocks, session_id
+        )
+        return self.block_pool.aging_block(aging_blocks)
+
+    def save_new_computed_blocks_with_session(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        session_id: str | None,
+    ) -> None:
+        if request_id not in self.num_cached_block and session_id is not None:
+            self.kv_cache_session_manager.add_blocks(
+                new_computed_blocks, session_id
+            )
+        self.save_new_computed_blocks(request_id, new_computed_blocks)
+
+    def allocate_new_blocks_with_session(
+        self, request_id: str, num_tokens: int, session_id: str | None
+    ) -> list[KVCacheBlock]:
+        blocks = self.allocate_new_blocks(request_id, num_tokens)
+        if len(blocks) > 0 and session_id is not None:
+            self.kv_cache_session_manager.reset_blocks(blocks, session_id)
+        logger.debug("new block cnt %s", len(blocks))
+        return blocks
 
     def get_num_blocks_to_allocate(
         self,

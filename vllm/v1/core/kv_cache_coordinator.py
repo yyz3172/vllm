@@ -144,6 +144,43 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def aging_block(self, session_id, block_hashes) -> int:
+        num = 0
+        for manager in self.single_type_managers:
+            num += manager.aging_block(session_id, block_hashes)
+        return num
+
+    def save_new_computed_blocks_with_session(
+        self,
+        request_id: str,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        session_id: str | None = None,
+    ) -> None:
+        for i, manager in enumerate(self.single_type_managers):
+            manager.save_new_computed_blocks_with_session(
+                request_id, new_computed_blocks[i], session_id
+            )
+
+    def allocate_new_blocks_with_session(
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_encoder_tokens: int = 0,
+        session_id: str | None = None,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        return tuple(
+            manager.allocate_new_blocks_with_session(
+                request_id,
+                (
+                    num_encoder_tokens
+                    if isinstance(manager, CrossAttentionManager)
+                    else num_tokens
+                ),
+                session_id,
+            )
+            for manager in self.single_type_managers
+        )
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.

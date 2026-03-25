@@ -6,7 +6,7 @@ import signal
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from inspect import isclass, signature
@@ -61,7 +61,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -70,7 +70,43 @@ logger = init_logger(__name__)
 POLLING_TIMEOUT_S = 2.5
 HANDSHAKE_TIMEOUT_MINS = 5
 
+import json
+
 _R = TypeVar("_R")  # Return type for collective_rpc
+
+
+def pack_request_sharing_cache_salt(request_id: str,
+                                     sharing_cache_salt: str) -> str:
+    try:
+        req_and_salt = {
+            "request_id": request_id,
+            "sharing_cache_salt": sharing_cache_salt,
+        }
+        return json.dumps(req_and_salt)
+    except Exception:
+        return request_id
+
+
+def unpack_sharing_cache_salt(request_id_and_salt: str) -> str | None:
+    try:
+        req_and_salt = json.loads(request_id_and_salt)
+        return req_and_salt["sharing_cache_salt"]
+    except json.decoder.JSONDecodeError:
+        return None
+
+
+def encode_engine_core_request(
+    request: EngineCoreRequest,
+) -> "Sequence[bytestr]":
+    encoder = MsgpackEncoder()
+    return encoder.encode(request)
+
+
+def decode_engine_core_request(
+    frame: "Sequence[bytestr]",
+) -> EngineCoreRequest:
+    decoder = MsgpackDecoder(EngineCoreRequest)
+    return decoder.decode(frame)
 
 
 class EngineCore:
@@ -265,6 +301,30 @@ class EngineCore:
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
+
+    def release_kv_cache(
+        self,
+        session_id: str,
+        token_requests: list[tuple[Sequence[bytestr], int]],
+    ) -> int:
+        released_blocks = 0
+        for params, release_index in token_requests:
+            request = decode_engine_core_request(params)
+            logger.debug("request decode %s", request)
+            req = Request.from_engine_core_request(
+                request, self.request_block_hasher
+            )
+            if not req.all_token_ids:
+                release_block_index = 0
+            else:
+                release_block_index = (
+                    (release_index * len(req.block_hashes))
+                    // len(req.all_token_ids)
+                )
+            released_blocks += self.scheduler.release_kv_cache(
+                session_id, req.block_hashes[release_block_index:]
+            )
+        return released_blocks
 
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
