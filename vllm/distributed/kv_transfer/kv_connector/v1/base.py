@@ -514,6 +514,30 @@ class KVConnectorBase_V1(ABC):
         """
         return ()
 
+    def notify_release(
+        self,
+        block_hashes: list,
+        gpu_block_ids: list[int],
+    ) -> int:
+        """
+        Notify connector that blocks have been released via
+        release_kv_cache API and should be stored to external storage.
+
+        Called by the scheduler in release_kv_cache(). Default is a
+        no-op. Override in connectors that support release offloading
+        (e.g. UCMConnector stores to DRAM/disk, OffloadingConnector
+        stores to CPU pinned memory).
+
+        Args:
+            block_hashes: block hashes of released blocks.
+            gpu_block_ids: corresponding GPU/NPU block IDs whose
+                data is still valid in device memory.
+
+        Returns:
+            Number of blocks accepted for storage.
+        """
+        return 0
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """

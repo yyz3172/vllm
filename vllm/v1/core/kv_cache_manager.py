@@ -336,6 +336,12 @@ class KVCacheManager:
                          block_hashes: list[BlockHash]) -> int:
         return self.coordinator.aging_block(session_id, block_hashes)
 
+    def get_gpu_block_ids_for_hashes(
+        self, block_hashes: list
+    ) -> list[int]:
+        """Resolve block hashes to GPU block IDs."""
+        return self.coordinator.get_gpu_block_ids_for_hashes(block_hashes)
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted

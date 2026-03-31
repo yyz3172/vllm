@@ -1529,9 +1529,40 @@ class Scheduler(SchedulerInterface):
 
     def release_kv_cache(self, session_id: str,
                          block_hashes: list) -> int:
-        return self.kv_cache_manager.release_kv_cache(
+        """Release KV cache blocks: aging + optional connector offload.
+
+        1. Aging: lower priority of matching prefix cache blocks.
+        2. If a KV connector is configured, notify it to store the
+           released blocks to external storage (UCM, CPU, etc.).
+        """
+        aged = self.kv_cache_manager.release_kv_cache(
             session_id, block_hashes
         )
+        logger.info(
+            "release_kv_cache: session_id=%s, num_block_hashes=%d, "
+            "aged=%d, has_connector=%s",
+            session_id, len(block_hashes), aged,
+            self.connector is not None,
+        )
+
+        # Offload released blocks via connector if configured
+        if self.connector is not None and aged > 0:
+            gpu_block_ids = (
+                self.kv_cache_manager.get_gpu_block_ids_for_hashes(
+                    block_hashes
+                )
+            )
+            if gpu_block_ids:
+                accepted = self.connector.notify_release(
+                    block_hashes, gpu_block_ids
+                )
+                logger.info(
+                    "release_kv_cache: connector accepted %d blocks "
+                    "for external storage",
+                    accepted,
+                )
+
+        return aged
 
     def shutdown(self) -> None:
         if self.kv_event_publisher:

@@ -132,6 +132,16 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def notify_release(
+        self,
+        block_hashes: list,
+        gpu_block_ids: list[int],
+    ) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.notify_release(
+            block_hashes, gpu_block_ids
+        )
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
@@ -337,12 +347,75 @@ class OffloadingConnectorScheduler:
 
         return reqs_to_store
 
+    def notify_release(
+        self,
+        block_hashes: list,
+        gpu_block_ids: list[int],
+    ) -> int:
+        """Store released blocks to CPU offloading backend.
+
+        Called by scheduler when release_kv_cache API is invoked.
+        Uses the same OffloadingManager as proactive stores.
+
+        Args:
+            block_hashes: block hashes of released blocks.
+            gpu_block_ids: corresponding GPU/NPU block IDs.
+
+        Returns:
+            Number of blocks accepted for storage.
+        """
+        if not block_hashes or not gpu_block_ids:
+            return 0
+
+        store_output = self.manager.prepare_store(block_hashes)
+        if store_output is None or not store_output.block_hashes_to_store:
+            return 0
+
+        # Map stored hashes back to GPU block IDs
+        hash_to_gpu_id = dict(zip(block_hashes, gpu_block_ids))
+        src_block_ids = [
+            hash_to_gpu_id[h]
+            for h in store_output.block_hashes_to_store
+            if h in hash_to_gpu_id
+        ]
+
+        if not src_block_ids:
+            return 0
+
+        src_spec = GPULoadStoreSpec(src_block_ids)
+        dst_spec = store_output.store_spec
+
+        # Use a synthetic request ID for release stores
+        release_id = f"__release_{id(store_output)}__"
+        self._reqs_being_stored[release_id].update(
+            store_output.block_hashes_to_store
+        )
+
+        # Queue the transfer; it will be executed via build_connector_meta
+        # → worker start_store_kv in the next scheduler step
+        if not hasattr(self, '_pending_release_stores'):
+            self._pending_release_stores: dict[ReqId, TransferSpec] = {}
+        self._pending_release_stores[release_id] = (src_spec, dst_spec)
+
+        logger.info(
+            "Release offload: queued %d blocks for CPU store",
+            len(src_block_ids),
+        )
+        return len(src_block_ids)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        reqs_to_store = self._get_reqs_to_store(scheduler_output)
+
+        # Merge pending release stores into reqs_to_store
+        if hasattr(self, '_pending_release_stores'):
+            reqs_to_store.update(self._pending_release_stores)
+            self._pending_release_stores = {}
+
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
-            reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            reqs_to_store=reqs_to_store,
         )
         self._reqs_to_load = {}
         return meta

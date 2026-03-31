@@ -181,6 +181,33 @@ class KVCacheCoordinator(ABC):
             for manager in self.single_type_managers
         )
 
+    def get_gpu_block_ids_for_hashes(
+        self, block_hashes: list
+    ) -> list[int]:
+        """Resolve block hashes to GPU block IDs via cached_block_hash_to_block.
+
+        Args:
+            block_hashes: list of BlockHash to resolve.
+
+        Returns:
+            list of GPU block IDs for hashes that are still cached.
+        """
+        if not self.single_type_managers:
+            return []
+        block_pool = self.single_type_managers[0].block_pool
+        gpu_block_ids = []
+        for bh in block_hashes:
+            from vllm.v1.core.kv_cache_utils import (
+                make_block_hash_with_group_id,
+            )
+            bh_with_group = make_block_hash_with_group_id(bh, 0)
+            block = block_pool.cached_block_hash_to_block.get_one_block(
+                bh_with_group
+            )
+            if block is not None:
+                gpu_block_ids.append(block.block_id)
+        return gpu_block_ids
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
