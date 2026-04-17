@@ -340,9 +340,33 @@ class Attention(nn.Module, AttentionLayerBase):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                self.impl.forward(
-                    self, query, key, value, self_kv_cache, attn_metadata, output=output
-                )
+                try:
+                    self.impl.forward(
+                        self,
+                        query,
+                        key,
+                        value,
+                        self_kv_cache,
+                        attn_metadata,
+                        output=output,
+                    )
+                except Exception as e:
+                    # Hard debug: surface exceptions inside AttentionImpl.forward
+                    # (especially on Ascend where opaque ops may hide Python errors).
+                    try:
+                        import logging as _logging
+                        import traceback as _traceback
+
+                        _logging.error(
+                            "AttentionLayer direct_call impl.forward raised: layer=%s impl=%s err=%r\n%s",
+                            self.layer_name,
+                            f"{self.impl.__class__.__module__}.{self.impl.__class__.__name__}",
+                            e,
+                            _traceback.format_exc(),
+                        )
+                    except Exception:
+                        pass
+                    raise
             else:
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name

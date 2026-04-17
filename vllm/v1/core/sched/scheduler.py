@@ -1085,6 +1085,12 @@ class Scheduler(SchedulerInterface):
                 kv_connector_output.invalid_block_ids
             )
 
+        # KV Connector: update state for finished KV transfers early, so any
+        # worker-provided kv_transfer_params updates are applied before we
+        # potentially call _free_request() / connector.request_finished().
+        if kv_connector_output:
+            self._update_from_kv_xfer_finished(kv_connector_output)
+
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -1217,10 +1223,6 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
-
-        # KV Connector: update state for finished KV Transfers.
-        if kv_connector_output:
-            self._update_from_kv_xfer_finished(kv_connector_output)
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -1640,6 +1642,33 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        # Apply worker-provided kv_transfer_params updates to requests.
+        try:
+            updates = getattr(kv_connector_output, "kv_transfer_params_updates", None)
+            if isinstance(updates, dict) and updates:
+                for req_id, upd in updates.items():
+                    if req_id not in self.requests:
+                        continue
+                    req = self.requests[req_id]
+                    if not isinstance(upd, dict):
+                        continue
+                    if req.kv_transfer_params is None:
+                        req.kv_transfer_params = {}
+                    elif not isinstance(req.kv_transfer_params, dict):
+                        # Client/proxy may supply a non-dict Mapping in extra_args;
+                        # ``update()`` requires a real dict or DynamicKV merge is skipped.
+                        try:
+                            req.kv_transfer_params = dict(req.kv_transfer_params)
+                        except Exception:
+                            req.kv_transfer_params = {}
+                    if isinstance(req.kv_transfer_params, dict):
+                        # Shallow merge at top level.
+                        req.kv_transfer_params.update(upd)
+        except Exception:
+            logger.exception(
+                "Failed to apply kv_transfer_params_updates from KVConnectorOutput"
+            )
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

@@ -107,8 +107,10 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
+    subclass_attention_metadata,
     split_attn_metadata,
 )
+from vllm.v1.worker.utils import extract_layer_index
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -832,6 +834,12 @@ class GPUModelRunner(
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
                 generator=generator,
+                kv_transfer_params=(
+                    sampling_params.extra_args.get("kv_transfer_params")
+                    if sampling_params is not None
+                    and sampling_params.extra_args is not None
+                    else None
+                ),
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
@@ -1628,6 +1636,89 @@ class GPUModelRunner(
                 logits_indices
             )
 
+        # NOTE: Some features (e.g. DynamicKV) require per-layer metadata
+        # even when layers share the same KV cache group. vLLM historically
+        # reused the same metadata object for all layers in a group; here we
+        # wrap the metadata object to attach `layer_name` and ensure layers can
+        # carry layer-specific fields without mutating each other.
+        _layer_name_wrapped_cls_cache: dict[type, type] = {}
+
+        def _compute_dynamic_kv_seq_lens_list(layer_name: str) -> list[int] | None:
+            # Expect kv_transfer_params to carry dynamic kv info:
+            #   kv_transfer_params["dynamic_kv"]["per_layer_kv_lens"]
+            # where per_layer_kv_lens is a list[int] indexed by layer_idx.
+            try:
+                layer_idx = extract_layer_index(layer_name, num_attn_module=1)
+            except Exception:
+                return None
+
+            seq_lens_list: list[int] = []
+            for req_id in self.input_batch.req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is None or not req_state.kv_transfer_params:
+                    seq_lens_list.append(-1)
+                    continue
+                dyn = req_state.kv_transfer_params.get("dynamic_kv") or {}
+                per_layer = dyn.get("per_layer_kv_lens")
+                if not isinstance(per_layer, list):
+                    seq_lens_list.append(-1)
+                    continue
+                if 0 <= layer_idx < len(per_layer):
+                    try:
+                        seq_lens_list.append(int(per_layer[layer_idx]))
+                    except Exception:
+                        seq_lens_list.append(-1)
+                else:
+                    seq_lens_list.append(-1)
+
+            # If nothing is provided for any request in the batch, skip.
+            if not seq_lens_list or all(v < 0 for v in seq_lens_list):
+                return None
+            return seq_lens_list
+
+        def _attach_layer_name_to_attn_metadata(meta: Any, layer_name: str) -> Any:
+            # Fast-path: if the metadata instance already supports `layer_name`,
+            # set it in-place.
+            try:
+                setattr(meta, "layer_name", layer_name)
+                # Also attach per-layer dynamic kv lens if the backend supports it.
+                dyn_list = _compute_dynamic_kv_seq_lens_list(layer_name)
+                if dyn_list is not None:
+                    try:
+                        setattr(meta, "dynamic_kv_seq_lens_list", dyn_list)
+                    except Exception:
+                        # Fall back to wrapping below if direct assignment fails.
+                        pass
+                # If direct assignment worked (or dyn_list is None), we can return.
+                if dyn_list is None or getattr(meta, "dynamic_kv_seq_lens_list", None) is dyn_list:
+                    return meta
+            except Exception:
+                pass
+
+            meta_cls = meta.__class__
+            wrapped_cls = _layer_name_wrapped_cls_cache.get(meta_cls)
+            if wrapped_cls is None:
+                wrapped_cls = subclass_attention_metadata(
+                    name_prefix="LayerNamed_",
+                    metadata_cls=meta_cls,
+                    fields=[
+                        ("layer_name", str, ""),
+                        ("dynamic_kv_seq_lens_list", list[int] | None, None),
+                    ],
+                )
+                _layer_name_wrapped_cls_cache[meta_cls] = wrapped_cls
+
+            wrapped = wrapped_cls()  # type: ignore[call-arg]
+            from dataclasses import fields as _dc_fields
+
+            for f in _dc_fields(meta_cls):
+                setattr(wrapped, f.name, getattr(meta, f.name))
+            wrapped.layer_name = layer_name
+            wrapped.dynamic_kv_seq_lens_list = _compute_dynamic_kv_seq_lens_list(
+                layer_name
+            )
+            return wrapped
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -1671,7 +1762,9 @@ class GPUModelRunner(
                 attn_metadata_dict = attn_metadata[ubid]
 
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name] = attn_metadata_i
+                attn_metadata_dict[layer_name] = _attach_layer_name_to_attn_metadata(
+                    attn_metadata_i, layer_name
+                )
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.

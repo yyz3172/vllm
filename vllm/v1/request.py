@@ -82,6 +82,30 @@ class Request:
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
+        # PD disaggregation: when the prompt KV is supplied externally (remote
+        # prefill), the decode node should not allocate KV blocks proportional
+        # to the original prompt length if the transfer footprint is explicitly
+        # shrunk (e.g., DynamicKV physical-block compression).
+        #
+        # When `num_prompt_blocks` + `block_size` are provided in
+        # kv_transfer_params, truncate the local prompt token ids to match the
+        # effective footprint. This keeps scheduler-side KV allocation stable
+        # and consistent with the actual transfer size.
+        try:
+            if (
+                isinstance(prompt_token_ids, list)
+                and isinstance(self.kv_transfer_params, dict)
+                and self.kv_transfer_params.get("do_remote_prefill")
+            ):
+                bs = int(self.kv_transfer_params.get("block_size", 0) or 0)
+                npb = int(self.kv_transfer_params.get("num_prompt_blocks", 0) or 0)
+                if bs > 0 and npb > 0:
+                    eff = bs * npb
+                    if eff > 0 and len(prompt_token_ids) > eff:
+                        prompt_token_ids = prompt_token_ids[:eff]
+        except Exception:
+            pass
+
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
