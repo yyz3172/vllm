@@ -76,7 +76,7 @@ def _dump_engine_exception(
     )
     try:
         dump_obj = prepare_object_to_dump(scheduler_output)
-        logger.error("Dumping scheduler output for model execution: %s", dump_obj)
+        # logger.error("Dumping scheduler output for model execution: %s", dump_obj)
         if scheduler_stats:
             logger.error("Dumping scheduler stats: %s", scheduler_stats)
     except Exception:

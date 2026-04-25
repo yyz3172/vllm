@@ -91,6 +91,19 @@ class Request:
         # kv_transfer_params, truncate the local prompt token ids to match the
         # effective footprint. This keeps scheduler-side KV allocation stable
         # and consistent with the actual transfer size.
+        #
+        # IMPORTANT: We MUST preserve the token id that the first decode step
+        # should consume at `token_ids_cpu[req, eff-1]`.
+        # vLLM/Ascend's first decode step reads `input_id` from
+        # `token_ids_cpu[req, num_computed_tokens]` where
+        # `num_computed_tokens == eff - 1`. Naive `prompt_token_ids[:eff]`
+        # would store a mid-prompt token at that slot.
+        #
+        # Fix: keep the prefix up to `eff - 1`, and overwrite the last slot
+        # with producer-provided `last_token_id` (fallback: original prompt
+        # tail). The earlier slots are never
+        # re-read by the model during decode (only used as KV in the cache
+        # which has already been transferred), so any value works there.
         try:
             if (
                 isinstance(prompt_token_ids, list)
@@ -102,7 +115,47 @@ class Request:
                 if bs > 0 and npb > 0:
                     eff = bs * npb
                     if eff > 0 and len(prompt_token_ids) > eff:
+                        original_last = int(prompt_token_ids[-1])
+                        # Producer carries the last sampled token in
+                        # kv_transfer_params. Decode should continue from this
+                        # token (not from the original prompt tail).
+                        remote_last = self.kv_transfer_params.get("last_token_id")
+                        remote_last_int: int | None = None
+                        try:
+                            if remote_last is not None:
+                                remote_last_int = int(remote_last)
+                        except Exception:
+                            remote_last_int = None
+                        tail_token = (
+                            remote_last_int
+                            if remote_last_int is not None
+                            else original_last
+                        )
+                        original_len = len(prompt_token_ids)
                         prompt_token_ids = prompt_token_ids[:eff]
+                        # Fill decode-start slot (eff-1). This is the token id
+                        # read by the first decode step.
+                        prompt_token_ids = list(prompt_token_ids)
+                        prompt_token_ids[-1] = tail_token
+                        try:
+                            from vllm.logger import init_logger
+                            _lg = init_logger(__name__)
+                            _lg.info(
+                                "[DynamicKV][PD] truncated prompt_token_ids: "
+                                "request_id=%s original_len=%d eff=%d "
+                                "tail_token=%d source=%s original_last=%d remote_last=%s",
+                                getattr(self, "request_id", "?"),
+                                original_len,
+                                eff,
+                                tail_token,
+                                "remote_last_token_id"
+                                if remote_last_int is not None
+                                else "prompt_tail",
+                                original_last,
+                                str(remote_last),
+                            )
+                        except Exception:
+                            pass
         except Exception:
             pass
 
