@@ -64,6 +64,12 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # P/D remote prefill may sample the first output token on the producer
+        # and pass it as `last_token_id` so the decode worker can continue from
+        # it. Keep it separate from `output_token_ids`: it must be returned to
+        # the client, but it is also used as the first decode input and should
+        # not be duplicated in the local token buffer.
+        self._pending_remote_prefill_output_token_ids: list[int] = []
 
         if pooling_params is not None:
             # Pooling models.
@@ -114,7 +120,7 @@ class Request:
                 npb = int(self.kv_transfer_params.get("num_prompt_blocks", 0) or 0)
                 if bs > 0 and npb > 0:
                     eff = bs * npb
-                    if eff > 0 and len(prompt_token_ids) > eff:
+                    if eff > 0 and len(prompt_token_ids) != eff:
                         original_last = int(prompt_token_ids[-1])
                         # Producer carries the last sampled token in
                         # kv_transfer_params. Decode should continue from this
@@ -131,8 +137,21 @@ class Request:
                             if remote_last_int is not None
                             else original_last
                         )
+                        if remote_last_int is not None:
+                            self._pending_remote_prefill_output_token_ids = [
+                                remote_last_int
+                            ]
                         original_len = len(prompt_token_ids)
-                        prompt_token_ids = prompt_token_ids[:eff]
+                        if len(prompt_token_ids) > eff:
+                            prompt_token_ids = prompt_token_ids[:eff]
+                        else:
+                            # Block-aligned external KV can be longer than the
+                            # original prompt for short requests. Pad token ids
+                            # so the scheduler/model runner can read the
+                            # decode-start slot at eff-1.
+                            prompt_token_ids = list(prompt_token_ids) + [
+                                original_last
+                            ] * (eff - len(prompt_token_ids))
                         # Fill decode-start slot (eff-1). This is the token id
                         # read by the first decode step.
                         prompt_token_ids = list(prompt_token_ids)
@@ -213,6 +232,16 @@ class Request:
             self.block_hashes = self.get_hash_new_full_blocks()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+
+    def pop_pending_remote_prefill_output_token_ids(self) -> list[int]:
+        """Return remote prefill output tokens once, without affecting decode state."""
+        token_ids = self._pending_remote_prefill_output_token_ids
+        self._pending_remote_prefill_output_token_ids = []
+        return token_ids
+
+    def peek_pending_remote_prefill_output_token_ids(self) -> list[int]:
+        """Inspect remote prefill output tokens without consuming them."""
+        return self._pending_remote_prefill_output_token_ids
 
     @classmethod
     def from_engine_core_request(

@@ -1143,6 +1143,22 @@ class Scheduler(SchedulerInterface):
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
             status_before_stop = request.status
+            pending_remote_prefill_token_ids = (
+                request.peek_pending_remote_prefill_output_token_ids()
+            )
+            pending_remote_prefill_count = len(pending_remote_prefill_token_ids)
+            if pending_remote_prefill_count:
+                remaining = request.max_tokens - pending_remote_prefill_count
+                if remaining <= 0:
+                    # The producer-side prefill token already exhausts the
+                    # user-visible generation budget. The local decode token was
+                    # needed only to drive the engine step; drop it from output
+                    # and stop the request.
+                    new_token_ids = []
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                    stopped = True
+                elif len(new_token_ids) > remaining:
+                    new_token_ids = new_token_ids[:remaining]
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -1153,6 +1169,11 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+
+            if pending_remote_prefill_count and not stopped:
+                if request.num_output_tokens + pending_remote_prefill_count >= request.max_tokens:
+                    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+                    stopped = True
 
             if stopped:
                 kv_transfer_params = self._free_request(request)
@@ -1178,14 +1199,23 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
+            pending_remote_prefill_token_ids = (
+                request.pop_pending_remote_prefill_output_token_ids()
+            )
+            emitted_new_token_ids = (
+                pending_remote_prefill_token_ids + new_token_ids
+                if pending_remote_prefill_token_ids
+                else new_token_ids
+            )
+
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params:
+            if emitted_new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
-                        new_token_ids=new_token_ids,
+                        new_token_ids=emitted_new_token_ids,
                         finish_reason=request.get_finished_reason(),
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
