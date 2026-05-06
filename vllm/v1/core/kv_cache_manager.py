@@ -84,6 +84,17 @@ class KVCacheBlocks:
         assert len(self.blocks) == 1, "Only one group is supported"
         return [block.block_id for block in self.blocks[0] if block.block_hash is None]
 
+    def get_unhashed_block_ids_by_group(self) -> tuple[list[int], ...]:
+        """Get block_ids of unhashed blocks for each kv_cache_group.
+
+        Returns:
+            tuple[list[int], ...]: outer tuple aligns with kv_cache_groups.
+        """
+        return tuple(
+            [block.block_id for block in group if block.block_hash is None]
+            for group in self.blocks
+        )
+
     def new_empty(self) -> "KVCacheBlocks":
         """
         Creates a new KVCacheBlocks instance with no blocks.

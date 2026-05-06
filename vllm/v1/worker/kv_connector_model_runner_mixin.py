@@ -140,6 +140,28 @@ class KVConnectorModelRunnerMixin:
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
 
+            # Allow worker-side connector to pass per-request kv_transfer_params
+            # updates (e.g., DynamicKV per-layer lens) back to the scheduler.
+            try:
+                if hasattr(kv_connector, "drain_kv_transfer_params_updates"):
+                    # Drain only for requests that actually finished sending/recving
+                    # this step (connector-dependent).
+                    req_ids_set = set()
+                    if output.finished_sending:
+                        req_ids_set.update(output.finished_sending)
+                    if output.finished_recving:
+                        req_ids_set.update(output.finished_recving)
+                    if not req_ids_set and scheduler_output.finished_req_ids:
+                        # Fallback: use scheduler's finished request ids if connector
+                        # doesn't provide finished_sending/recving.
+                        req_ids_set.update(scheduler_output.finished_req_ids)
+                    req_ids = list(req_ids_set)
+                    updates = kv_connector.drain_kv_transfer_params_updates(req_ids)
+                    if isinstance(updates, dict) and updates:
+                        output.kv_transfer_params_updates = updates
+            except Exception:
+                pass
+
             kv_connector.clear_connector_metadata()
 
     @staticmethod

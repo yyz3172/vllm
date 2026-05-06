@@ -5,7 +5,7 @@ KV cache helper for store.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -20,6 +20,25 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 
 logger = init_logger(__name__)
+
+
+def _kv_xfer_params_update_dynkv_score(upd: dict[str, Any]) -> int:
+    """Score worker-side ``kv_transfer_params_updates`` entries for merge order.
+
+    Tensor-parallel workers may all emit an ``updates[req_id]`` dict; we must not
+    let an empty / placeholder ``dynamic_kv`` win over a peer that carries real
+    ``per_layer_kv_lens`` (first-writer-wins would otherwise drop DynamicKV).
+    """
+    try:
+        dyn = upd.get("dynamic_kv")
+        if not isinstance(dyn, dict):
+            return 0
+        pl = dyn.get("per_layer_kv_lens")
+        if not isinstance(pl, list) or not pl:
+            return 0
+        return sum(int(x) for x in pl)
+    except Exception:
+        return 0
 
 
 def get_kv_connector_cache_layout():
@@ -80,6 +99,7 @@ class KVOutputAggregator:
         aggregated_kv_connector_stats = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
+        merged_kv_transfer_params_updates: dict[str, dict[str, Any]] = {}
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -135,6 +155,21 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
+            ku = getattr(kv_output, "kv_transfer_params_updates", None)
+            if isinstance(ku, dict):
+                for req_id, upd in ku.items():
+                    if not isinstance(upd, dict):
+                        continue
+                    prev = merged_kv_transfer_params_updates.get(req_id)
+                    if prev is None:
+                        merged_kv_transfer_params_updates[req_id] = upd
+                    elif not isinstance(prev, dict):
+                        merged_kv_transfer_params_updates[req_id] = upd
+                    elif _kv_xfer_params_update_dynkv_score(
+                        upd
+                    ) > _kv_xfer_params_update_dynkv_score(prev):
+                        merged_kv_transfer_params_updates[req_id] = upd
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -146,6 +181,8 @@ class KVOutputAggregator:
             kv_cache_events=combined_kv_cache_events or None,
             invalid_block_ids=invalid_block_ids,
             expected_finished_count=self._expected_finished_count,
+            kv_transfer_params_updates=merged_kv_transfer_params_updates
+            or None,
         )
 
         return output

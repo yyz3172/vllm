@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -120,6 +120,10 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # Optional per-request KV transfer params updates produced on worker side.
+    # This allows worker-side logic (e.g., DynamicKV) to pass results back to
+    # the scheduler process so connectors can attach them in request_finished().
+    kv_transfer_params_updates: dict[str, dict[str, Any]] | None = None
 
     def is_empty(self):
         return (
@@ -128,6 +132,7 @@ class KVConnectorOutput:
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
+            and not self.kv_transfer_params_updates
         )
 
 
