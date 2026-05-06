@@ -257,11 +257,11 @@ class LoggingStatLogger(StatLoggerBase):
 
     def log_engine_initialized(self):
         if self.vllm_config.cache_config.num_gpu_blocks:
-            logger.debug(
-                "Engine %03d: vllm cache_config_info with initialization "
-                "after num_gpu_blocks is: %d",
+            logger.info(
+                "Engine %03d: CacheConfig num_gpu_blocks=%d block_size=%s",
                 self.engine_index,
                 self.vllm_config.cache_config.num_gpu_blocks,
+                self.vllm_config.cache_config.block_size,
             )
 
 

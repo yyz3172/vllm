@@ -64,6 +64,12 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # P/D remote prefill may sample the first output token on the producer
+        # and pass it as `last_token_id` so the decode worker can continue from
+        # it. Keep it separate from `output_token_ids`: it must be returned to
+        # the client, but it is also used as the first decode input and should
+        # not be duplicated in the local token buffer.
+        self._pending_remote_prefill_output_token_ids: list[int] = []
 
         if pooling_params is not None:
             # Pooling models.
@@ -81,6 +87,96 @@ class Request:
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
+
+        # PD disaggregation: when the prompt KV is supplied externally (remote
+        # prefill), the decode node should not allocate KV blocks proportional
+        # to the original prompt length if the transfer footprint is explicitly
+        # shrunk (e.g., DynamicKV physical-block compression).
+        #
+        # When `num_prompt_blocks` + `block_size` are provided in
+        # kv_transfer_params, truncate the local prompt token ids to match the
+        # effective footprint. This keeps scheduler-side KV allocation stable
+        # and consistent with the actual transfer size.
+        #
+        # IMPORTANT: We MUST preserve the token id that the first decode step
+        # should consume at `token_ids_cpu[req, eff-1]`.
+        # vLLM/Ascend's first decode step reads `input_id` from
+        # `token_ids_cpu[req, num_computed_tokens]` where
+        # `num_computed_tokens == eff - 1`. Naive `prompt_token_ids[:eff]`
+        # would store a mid-prompt token at that slot.
+        #
+        # Fix: keep the prefix up to `eff - 1`, and overwrite the last slot
+        # with producer-provided `last_token_id` (fallback: original prompt
+        # tail). The earlier slots are never
+        # re-read by the model during decode (only used as KV in the cache
+        # which has already been transferred), so any value works there.
+        try:
+            if (
+                isinstance(prompt_token_ids, list)
+                and isinstance(self.kv_transfer_params, dict)
+                and self.kv_transfer_params.get("do_remote_prefill")
+            ):
+                bs = int(self.kv_transfer_params.get("block_size", 0) or 0)
+                npb = int(self.kv_transfer_params.get("num_prompt_blocks", 0) or 0)
+                if bs > 0 and npb > 0:
+                    eff = bs * npb
+                    if eff > 0 and len(prompt_token_ids) != eff:
+                        original_last = int(prompt_token_ids[-1])
+                        # Producer carries the last sampled token in
+                        # kv_transfer_params. Decode should continue from this
+                        # token (not from the original prompt tail).
+                        remote_last = self.kv_transfer_params.get("last_token_id")
+                        remote_last_int: int | None = None
+                        try:
+                            if remote_last is not None:
+                                remote_last_int = int(remote_last)
+                        except Exception:
+                            remote_last_int = None
+                        tail_token = (
+                            remote_last_int
+                            if remote_last_int is not None
+                            else original_last
+                        )
+                        if remote_last_int is not None:
+                            self._pending_remote_prefill_output_token_ids = [
+                                remote_last_int
+                            ]
+                        original_len = len(prompt_token_ids)
+                        if len(prompt_token_ids) > eff:
+                            prompt_token_ids = prompt_token_ids[:eff]
+                        else:
+                            # Block-aligned external KV can be longer than the
+                            # original prompt for short requests. Pad token ids
+                            # so the scheduler/model runner can read the
+                            # decode-start slot at eff-1.
+                            prompt_token_ids = list(prompt_token_ids) + [
+                                original_last
+                            ] * (eff - len(prompt_token_ids))
+                        # Fill decode-start slot (eff-1). This is the token id
+                        # read by the first decode step.
+                        prompt_token_ids = list(prompt_token_ids)
+                        prompt_token_ids[-1] = tail_token
+                        try:
+                            from vllm.logger import init_logger
+                            _lg = init_logger(__name__)
+                            _lg.info(
+                                "[DynamicKV][PD] truncated prompt_token_ids: "
+                                "request_id=%s original_len=%d eff=%d "
+                                "tail_token=%d source=%s original_last=%d remote_last=%s",
+                                getattr(self, "request_id", "?"),
+                                original_len,
+                                eff,
+                                tail_token,
+                                "remote_last_token_id"
+                                if remote_last_int is not None
+                                else "prompt_tail",
+                                original_last,
+                                str(remote_last),
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -136,6 +232,16 @@ class Request:
             self.block_hashes = self.get_hash_new_full_blocks()
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
+
+    def pop_pending_remote_prefill_output_token_ids(self) -> list[int]:
+        """Return remote prefill output tokens once, without affecting decode state."""
+        token_ids = self._pending_remote_prefill_output_token_ids
+        self._pending_remote_prefill_output_token_ids = []
+        return token_ids
+
+    def peek_pending_remote_prefill_output_token_ids(self) -> list[int]:
+        """Inspect remote prefill output tokens without consuming them."""
+        return self._pending_remote_prefill_output_token_ids
 
     @classmethod
     def from_engine_core_request(

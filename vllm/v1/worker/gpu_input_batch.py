@@ -3,7 +3,7 @@
 # Datastructures defining a GPU input batch
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -34,10 +34,14 @@ class CachedRequestState:
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams | None
     generator: torch.Generator | None
-
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     output_token_ids: list[int]
+
+    # Disaggregated serving: Connector-specific KV transfer parameters.
+    # This is copied from SamplingParams.extra_args["kv_transfer_params"] when
+    # present, so model runner code can access it without depending on Request.
+    kv_transfer_params: dict[str, Any] | None = None
 
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: int | None = None
