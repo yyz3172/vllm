@@ -36,7 +36,13 @@ def _kv_xfer_params_update_dynkv_score(upd: dict[str, Any]) -> int:
         pl = dyn.get("per_layer_kv_lens")
         if not isinstance(pl, list) or not pl:
             return 0
-        return sum(int(x) for x in pl)
+        s = sum(int(x) for x in pl)
+        # Tie-break (same sum across TP ranks): prefer payload that also carries
+        # offload PD shrink metadata so Mooncake can avoid allocator-order slices.
+        prb = dyn.get("prefix_remote_block_ids")
+        if isinstance(prb, list) and prb:
+            s += 1
+        return s
     except Exception:
         return 0
 
@@ -165,10 +171,11 @@ class KVOutputAggregator:
                         merged_kv_transfer_params_updates[req_id] = upd
                     elif not isinstance(prev, dict):
                         merged_kv_transfer_params_updates[req_id] = upd
-                    elif _kv_xfer_params_update_dynkv_score(
-                        upd
-                    ) > _kv_xfer_params_update_dynkv_score(prev):
-                        merged_kv_transfer_params_updates[req_id] = upd
+                    else:
+                        s_new = _kv_xfer_params_update_dynkv_score(upd)
+                        s_prev = _kv_xfer_params_update_dynkv_score(prev)
+                        if s_new > s_prev:
+                            merged_kv_transfer_params_updates[req_id] = upd
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
