@@ -224,6 +224,104 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
         )
 
+@dataclass(frozen=True)
+class TurboQuantAttentionSpec(FullAttentionSpec):
+    """
+    KV cache spec for TurboQuant-packed K/V (TurboQuantMSE).
+
+    Storage layout (per token, per kv-head vector, ``torch.uint8`` row of
+    length ``P = max(P_key, P_value)``; the narrower side is zero-padded):
+
+    - **4-bit**: indices packed as uint4 in uint8 (``head_size / 2`` bytes)
+      plus fp16 norm (2 bytes); ``P_per = head_size // 2 + 2``.
+    - **8-bit**: one uint8 index per dimension (``head_size`` bytes) plus
+      fp16 norm (2 bytes); ``P_per = head_size + 2``.
+
+    ``bits`` is the **key** quant width; ``kv_value_bits`` optionally overrides
+    the **value** width (default: same as key). Configure via
+    ``additional_config['turboquant_kv_bits']``: an int, ``[key, value]``, or
+    ``{"key": 8, "value": 4}``.
+    """
+
+    cache_dtype_str: str | None = None
+    bits: int = 4
+    kv_value_bits: int | None = None
+
+    @property
+    def bits_key(self) -> int:
+        return self.bits
+
+    @property
+    def bits_value(self) -> int:
+        return self.bits if self.kv_value_bits is None else self.kv_value_bits
+
+    @property
+    def page_size_bytes(self) -> int:
+        from vllm.model_executor.layers.turboquant_kv_cache import (
+            turboquant_packed_bytes_per_vector,
+        )
+
+        pk = turboquant_packed_bytes_per_vector(self.head_size, bits=self.bits_key)
+        pv = turboquant_packed_bytes_per_vector(self.head_size, bits=self.bits_value)
+        per_vec = max(pk, pv)
+        return 2 * self.block_size * self.num_kv_heads * per_vec
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, TurboQuantAttentionSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be "
+            "TurboQuantAttentionSpec."
+        )
+
+        sliding_window = set(
+            spec.sliding_window for spec in specs if spec.sliding_window is not None
+        )
+        attention_chunk_size = set(
+            spec.attention_chunk_size
+            for spec in specs
+            if spec.attention_chunk_size is not None
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        bits_set = set(spec.bits for spec in specs)
+        kv_value_bits_set = set(spec.kv_value_bits for spec in specs)
+        assert len(cache_dtype_str_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "TurboQuant cache_dtype_str."
+        )
+        assert len(bits_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "TurboQuant key bits width."
+        )
+        assert len(kv_value_bits_set) == 1, (
+            "All attention layers in the same KV cache group must use the same "
+            "TurboQuant value bits override."
+        )
+        merged_spec = cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            sliding_window=FullAttentionSpec.merge_window_sizes(sliding_window),
+            attention_chunk_size=FullAttentionSpec.merge_window_sizes(
+                attention_chunk_size
+            ),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            bits=bits_set.pop(),
+            kv_value_bits=kv_value_bits_set.pop(),
+        )
+        for spec in specs:
+            for f in fields(AttentionSpec):
+                assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
+                    "All attention layers in the same KV cache group must have "
+                    "the same attention spec."
+                )
+        assert (merged_spec.sliding_window is not None) + (
+            merged_spec.attention_chunk_size is not None
+        ) <= 1, (
+            "Model with both sliding window attention and chunked local attention "
+            "layers is not supported."
+        )
+        return merged_spec
 
 @dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):

@@ -14,6 +14,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.turboquant_kv_cache import (
+    parse_turboquant_kv_bits_key_value,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.linear import (
@@ -39,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    TurboQuantAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -530,6 +534,21 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            if vllm_config.cache_config.cache_dtype == "turboquant":
+                k_bits, v_bits = parse_turboquant_kv_bits_key_value(
+                    vllm_config.additional_config
+                )
+                spec_kw: dict = dict(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    dtype=self.kv_cache_torch_dtype,
+                    cache_dtype_str=vllm_config.cache_config.cache_dtype,
+                    bits=k_bits,
+                )
+                if k_bits != v_bits:
+                    spec_kw["kv_value_bits"] = v_bits
+                return TurboQuantAttentionSpec(**spec_kw)
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
